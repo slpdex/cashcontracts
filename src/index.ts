@@ -46,7 +46,7 @@ export class Wallet {
     private outgoingEventSource: EventSource
     private utxos: List<UtxoEntry>
     private tokenUtxos: Map<TokenId, List<SLPUtxoEntry>>
-    private tokenDetails: Map<TokenId, TokenDetails>
+    private tokenDetailsMap: Map<TokenId, TokenDetails>
     
     private receivedTxListeners: (() => void)[]
 
@@ -57,7 +57,7 @@ export class Wallet {
                         address: cashcontracts.Address,
                         utxos: List<UtxoEntry>,
                         tokenUtxos: Map<string, List<SLPUtxoEntry>>,
-                        tokenDetails: Map<TokenId, TokenDetails>) {
+                        tokenDetailsMap: Map<TokenId, TokenDetails>) {
         this.curve = curve
         this.secret = secret
         this.pubkey = pubkey
@@ -67,7 +67,7 @@ export class Wallet {
         this.wallet = wallet
         this.utxos = utxos
         this.tokenUtxos = tokenUtxos
-        this.tokenDetails = tokenDetails
+        this.tokenDetailsMap = tokenDetailsMap
         this.receivedTxListeners = []
         this.incomingEventSource = this.createIncomingEventSource()
         this.outgoingEventSource = this.createOutgoingEventSource()
@@ -178,8 +178,8 @@ export class Wallet {
     public async updateWallet(): Promise<void> {
         this.utxos = await Wallet.fetchUtxos(this.address.cash_addr())
         const utxosJsonByToken = await Wallet.fetchTokenUtxos(this.slpAddress.cash_addr())
-        this.tokenDetails = await Wallet.fetchTokenDetails(utxosJsonByToken.keySeq().toList())
-        this.tokenUtxos = Wallet.calculateBaseToken(utxosJsonByToken, this.tokenDetails)
+        this.tokenDetailsMap = await Wallet.fetchTokenDetails(utxosJsonByToken.keySeq().toList())
+        this.tokenUtxos = Wallet.calculateBaseToken(utxosJsonByToken, this.tokenDetailsMap)
         this.outgoingEventSource.close()
         this.outgoingEventSource = this.createOutgoingEventSource()
     }
@@ -280,8 +280,12 @@ export class Wallet {
             .reduce((a, b) => a + b, 0)
     }
 
+    public tokenDetails(tokenId: TokenId): TokenDetails {
+        return this.tokenDetailsMap.get(tokenId, keyError(tokenId))
+    }
+
     public toTokenBaseAmount(tokenId: TokenId, amount: number): number {
-        return amount * Math.pow(10, this.tokenDetails.get(tokenId, keyError(tokenId)).decimals)
+        return amount * Math.pow(10, this.tokenDetailsMap.get(tokenId, keyError(tokenId)).decimals)
     }
 
     public initNonTokenTx(): UnsignedTx {
@@ -302,7 +306,7 @@ export class Wallet {
     public initTokenTx(tokenId: TokenId): UnsignedTokenTx {
         const nonTokenUtxos = this.nonTokenUtxos()
         const tokenUtxos = this.tokenUtxos.get(tokenId, keyError(tokenId))
-        const tokenDetails = this.tokenDetails.get(tokenId, keyError(tokenId))
+        const tokenDetails = this.tokenDetailsMap.get(tokenId, keyError(tokenId))
         return new UnsignedTokenTx(
             this.curve,
             this.secret,
@@ -360,7 +364,7 @@ interface ReceivedTx {
     }[]
 }
 
-interface TokenDetails {
+export interface TokenDetails {
     id: string
     timestamp: string
     symbol: string
