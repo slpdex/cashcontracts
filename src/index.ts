@@ -3,12 +3,15 @@ import * as cashcontracts from "cashcontracts-wasm"
 import { List, Map, Set } from "immutable"
 import * as Immutable from "immutable"
 import { Base64 } from 'js-base64'
+import { BigNumber } from 'bignumber.js'
 
 export type TokenId = string
 export type UtxoId = string
 
-export const DUST_AMOUNT = 0x222
+export const DUST_AMOUNT = new BigNumber('546')
+export const MAX_INT = new BigNumber('2').pow('31')
 
+export const ready = cashcontracts.ready
 
 const EMPTY_CASH_ADDR = 'bitcoincash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqfnhks603'
 const EMPTY_SLP_ADDR = 'simpleledger:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9gud9630'
@@ -40,16 +43,21 @@ function keyError(key: any): never {
     }}) as never
 }
 
-function sleep(milliseconds: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, milliseconds))
+function err<T>(f: () => T): T {
+    try {
+        return f()
+    } catch (e) {
+        console.error(e)
+        throw e
+    }
 }
 
 export type TxDirection = 'incoming' | 'outgoing' | 'update'
 export type TxKind = 'SLP' | 'default'
 export interface TxEvent {
     direction: TxDirection
-    nonTokenDelta: number
-    tokenDelta: Map<TokenId, number>
+    nonTokenDelta: BigNumber
+    tokenDelta: Map<TokenId, BigNumber>
 }
 
 export interface Endpoint {
@@ -76,8 +84,12 @@ class EndpointDefault implements Endpoint {
     }
 
     async fetchUtxos(address: string): Promise<List<UtxoEntry>> {
-        const utxosJson: {utxos: UtxoEntry[]} = await (await fetch("https://rest.bitcoin.com/v2/address/utxo/" + address)).json()
-        return List(utxosJson.utxos)
+        const utxosJson: {utxos: UtxoEntryRemote[]} = await (await fetch("https://rest.bitcoin.com/v2/address/utxo/" + address)).json()
+        return List(utxosJson.utxos).map(utxo => ({
+            txid: utxo.txid,
+            vout: utxo.vout,
+            satoshis: new BigNumber(utxo.satoshis),
+        }))
     }
 
     async fetchTokenDetails(tokenIds: List<string>): Promise<Map<string, TokenDetails>> {
@@ -135,8 +147,7 @@ class Utxos {
     private static calculateBaseToken(utxosJson: List<SLPUtxoEntryRemote>,
                                       details: Map<string, TokenDetails>) {
         return utxosJson.map(utxo => {
-            const amountFactor = Math.pow(
-                10,
+            const amountFactor = new BigNumber('10').pow(
                 details.get(
                     utxo.tokenDetails.tokenIdHex,
                     keyError(utxo.tokenDetails.tokenIdHex)
@@ -144,7 +155,7 @@ class Utxos {
             )
             return {
                 ...utxo,
-                slpBaseAmount: parseFloat(utxo.slpAmount) * amountFactor,
+                slpBaseAmount: new BigNumber(utxo.slpAmount).times(amountFactor),
                 amountFactor: amountFactor,
             } as SLPUtxoEntry
         })
@@ -409,7 +420,7 @@ export class Wallet {
                 this._utxos.addNonTokenUtxo({
                     txid: tx.tx.h,
                     vout,
-                    satoshis: txOut.e.v,
+                    satoshis: new BigNumber(txOut.e.v),
                 })
             }
         }
@@ -430,7 +441,7 @@ export class Wallet {
                 this._utxos.addNonTokenUtxo({
                     txid: tx.tx.h,
                     vout: output.e.i,
-                    satoshis: output.e.v,
+                    satoshis: new BigNumber(output.e.v),
                 })
             }
         }
@@ -465,13 +476,13 @@ export class Wallet {
         this._isInitialized = true
         const event: TxEvent = {
             direction,
-            nonTokenDelta: this.nonTokenBalance() - balanceBefore,
+            nonTokenDelta: this.nonTokenBalance().minus(balanceBefore),
             tokenDelta: Map(
                 Set(balanceTokensBefore.keySeq().concat(this._utxos.tokenIds()))
-                    .map(tokenId => [tokenId, this.tokenBalance(tokenId) - balanceTokensBefore.get(tokenId, 0)])
-            ).filter(delta => delta != 0)
+                    .map(tokenId => [tokenId, this.tokenBalance(tokenId).minus(balanceTokensBefore.get(tokenId, '0'))])
+            ).filter(delta => !delta.isZero())
         }
-        if (event.nonTokenDelta == 0 && event.tokenDelta.size == 0)
+        if (event.nonTokenDelta.isZero() && event.tokenDelta.size == 0)
             return
         if (Wallet.debug)
             console.log('event', event, event.tokenDelta.toJS())
@@ -540,42 +551,38 @@ export class Wallet {
         return this._slpAddress.cash_addr()
     }
 
-    public totalBalance(): number {
-        throw "Disabled totalBalance as the value requires burning all tokens"
-    }
-
-    public nonTokenBalance(): number {
+    public nonTokenBalance(): BigNumber {
         return this._utxos.nonTokenUtxos()
             .map((utxoEntry) => utxoEntry.satoshis)
-            .reduce((a, b) => a + b, 0)
+            .reduce((a, b) => a.plus(b), new BigNumber('0'))
     }
 
     public tokenIds(): List<string> {
         return this._utxos.tokenIds()
     }
 
-    public tokenBalance(tokenId: TokenId): number {
+    public tokenBalance(tokenId: TokenId): BigNumber {
         const utxos = this._utxos.tokenUtxos().get(tokenId)
         if (utxos === undefined)
-            return 0
+            return new BigNumber('0')
         return utxos
             .map(utxoEntry => parseFloat(utxoEntry.slpAmount))
-            .reduce((a, b) => a + b, 0)
+            .reduce((a, b) => a.plus(b), new BigNumber('0'))
     }
 
     public tokenDetails(tokenId: TokenId): TokenDetails {
         return this._tokenDetailStore.tokenDetails().get(tokenId, keyError(tokenId))
     }
 
-    public toTokenBaseAmount(tokenId: TokenId, amount: number): number {
-        return amount * Math.pow(10, this._tokenDetailStore.tokenDetails().get(tokenId, keyError(tokenId)).decimals)
+    public toTokenBaseAmount(tokenId: TokenId, amount: BigNumber): BigNumber {
+        return amount.pow(new BigNumber('10').pow(this._tokenDetailStore.tokenDetails().get(tokenId, keyError(tokenId)).decimals))
     }
 
     public initNonTokenTx(include: "none" | undefined = undefined): UnsignedTx {
         const nonTokenUtxos = include == "none" ? [] : this._utxos.nonTokenUtxos().map(utxo => ({
             tx_id_hex: utxo.txid,
             vout: utxo.vout,
-            amount: utxo.satoshis.toString(),
+            amount: utxo.satoshis.toFixed(0),
         })).valueSeq().toArray()
         return new UnsignedTx(
             this._curve,
@@ -595,18 +602,18 @@ export class Wallet {
             this._secret,
             this._pubkey,
             tokenDetails,
-            tokenUtxos.map(utxo => utxo.slpBaseAmount).concat(nonTokenUtxos.map(() => 0)).valueSeq().toArray(),
+            tokenUtxos.map(utxo => utxo.slpBaseAmount).concat(nonTokenUtxos.map(() => new BigNumber('0'))).valueSeq().toArray(),
             this._wallet.init_tx(
                 tokenUtxos
                     .map(utxo => ({
                         tx_id_hex: utxo.txid,
                         vout: utxo.vout,
-                        amount: utxo.bchSatoshis.toString(),
+                        amount: utxo.bchSatoshis.toFixed(0),
                     }))
                     .concat(nonTokenUtxos.map(utxo => ({
                         tx_id_hex: utxo.txid,
                         vout: utxo.vout,
-                        amount: utxo.satoshis.toString(),
+                        amount: utxo.satoshis.toFixed(0),
                     })))
                     .valueSeq()
                     .toArray()
@@ -619,14 +626,20 @@ export class Wallet {
     }
 
     public privateKey(): PrivateKey {
-        return new PrivateKey(this._secret, this._sha256)
+        return new PrivateKey(this._secret, this._sha256, undefined)
     }
 }
 
-interface UtxoEntry {
+interface UtxoEntryRemote {
     txid: string
     vout: number
     satoshis: number
+}
+
+export interface UtxoEntry {
+    txid: string
+    vout: number
+    satoshis: BigNumber
 }
 
 interface SLPUtxoEntryRemote {
@@ -640,8 +653,8 @@ interface SLPUtxoEntryRemote {
 }
 
 interface SLPUtxoEntry extends SLPUtxoEntryRemote {
-    slpBaseAmount: number
-    amountFactor: number
+    slpBaseAmount: BigNumber
+    amountFactor: BigNumber
 }
 
 interface ReceivedTx {
@@ -676,19 +689,49 @@ interface ReceivedTx {
 }
 
 export class PrivateKey {
-    private secret: Uint8Array
-    private sha256: bitcoin.Sha256
+    private _secret: Uint8Array
+    private _wif: string
 
-    public constructor(secret: Uint8Array, sha256: bitcoin.Sha256) {
-        this.secret = secret
-        this.sha256 = sha256
+    public constructor(secret: Uint8Array, sha256: bitcoin.Sha256 | undefined, wif: string | undefined) {
+        this._secret = secret
+        if (wif !== undefined)
+            this._wif = wif
+        else if (sha256 !== undefined)
+            this._wif = this._calcWif(sha256)
+        else
+            throw 'Must provide either sha256 or wif'
+    }
+
+    private _calcWif(sha256: bitcoin.Sha256): string {
+        const extendedKey = [0x80].concat(Array.from(this._secret)).concat([0x01])
+        const doubleSha256 = sha256.hash(sha256.hash(new Uint8Array(extendedKey)))
+        extendedKey.push(...doubleSha256.slice(0, 4))
+        return cashcontracts.base58encode(new Uint8Array(extendedKey))
+    }
+
+    public static fromWif(wif: string, sha256: bitcoin.Sha256 | undefined): PrivateKey {
+        const bytes = cashcontracts.base58decode(wif)
+        const extendedKey = bytes.slice(0, bytes.length - 4)
+        const checksum = bytes.slice(bytes.length - 4)
+        if (sha256 !== undefined) {
+            const doubleSha256 = sha256.hash(sha256.hash(new Uint8Array(extendedKey)))
+            const actualChecksum = doubleSha256.slice(0, 4)
+            const isEqual = Array.from(checksum)
+                .map((item, idx) => actualChecksum[idx] == item)
+                .reduce((a,b) => a && b)
+            if (!isEqual)
+                throw "Invalid checksum"
+        }
+        const secret = extendedKey.slice(1, extendedKey.length - 1)
+        return new PrivateKey(secret, undefined, wif)
     }
 
     public wif(): string {
-        const extendedKey = [0x80].concat(Array.from(this.secret)).concat([0x01])
-        const doubleSha256 = this.sha256.hash(this.sha256.hash(new Uint8Array(extendedKey)))
-        extendedKey.push(...doubleSha256.slice(0, 4))
-        return cashcontracts.base58encode(new Uint8Array(extendedKey))
+        return this._wif
+    }
+
+    public secret(): Uint8Array {
+        return this._secret
     }
 }
 
@@ -784,34 +827,34 @@ export class UnsignedTx {
 
     addInput(input: UnsignedInput): number {
         this.inputSecrets.push(this.secret)
-        this.inputSecrets.push(this.pubkey)
-        return this.unsignedTx.add_input(input)
+        this.inputPubkeys.push(this.pubkey)
+        return err(() => this.unsignedTx.add_input(input))
     }
 
     addInputWithSecret(input: UnsignedInput, secret: Uint8Array): number {
         this.inputSecrets.push(secret)
         this.inputPubkeys.push(this.curve.derivePublicKeyCompressed(secret))
-        return this.unsignedTx.add_input(input)
+        return err(() => this.unsignedTx.add_input(input))
     }
 
     addOutput(output: OutputType): number {
-        return this.unsignedTx.add_output(output)
+        return err(() => this.unsignedTx.add_output(output))
     }
 
     addLeftoverOutput(address: string, feePerKb?: number, ignoreOverspend?: boolean): number | undefined {
-        return this.unsignedTx.add_leftover_output(address, feePerKb, ignoreOverspend)
+        return err(() => this.unsignedTx.add_leftover_output(address, feePerKb, ignoreOverspend))
     }
 
     insertLeftoverOutput(leftover_idx: number, address: string, feePerKb?: number) {
-        this.unsignedTx.insert_leftover_output(leftover_idx, address, feePerKb, undefined)
+        err(() => this.unsignedTx.insert_leftover_output(leftover_idx, address, feePerKb, undefined))
     }
 
     sign(): Tx {
-        const preImages: string[] = this.unsignedTx.pre_image_hashes()
-        const signatures = preImages.map((hash, idx) => {
+        const preImages: string[] = err(() => this.unsignedTx.pre_image_hashes())
+        const signatures = err(() => preImages.map((hash, idx) => {
             return bufferToHex(this.curve.signMessageHashDER(this.inputSecrets[idx], hexToBuffer(hash)))
-        })
-        return new Tx(this.unsignedTx.sign(signatures, this.inputPubkeys.map(bufferToHex)))
+        }))
+        return err(() => new Tx(this.unsignedTx.sign(signatures, this.inputPubkeys.map(bufferToHex))))
     }
 
     estimateSize(): number {
@@ -825,24 +868,24 @@ export class UnsignedTokenTx {
     private pubkey: Uint8Array
     private unsignedTx: cashcontracts.UnsignedTx | undefined
     private tokenDetails: TokenDetails
-    private tokenFactor: number
+    private tokenFactor: BigNumber
     private inputSecrets: Uint8Array[]
     private inputPubkeys: Uint8Array[]
-    private tokenInputAmounts: number[] = []
-    private tokenOutputAmounts: number[] = []
+    private tokenInputAmounts: BigNumber[] = []
+    private tokenOutputAmounts: BigNumber[] = []
     private outputs: OutputType[] = []
 
     constructor(curve: bitcoin.Secp256k1,
                 secret: Uint8Array,
                 pubkey: Uint8Array,
                 tokenDetails: TokenDetails,
-                tokenInputAmounts: number[], 
+                tokenInputAmounts: BigNumber[], 
                 unsignedTx: cashcontracts.UnsignedTx) {
         this.curve = curve
         this.secret = secret
         this.pubkey = pubkey
         this.tokenDetails = tokenDetails
-        this.tokenFactor = Math.pow(10, tokenDetails.decimals)
+        this.tokenFactor = new BigNumber('10').pow(tokenDetails.decimals)
         this.unsignedTx = unsignedTx
         this.inputSecrets = tokenInputAmounts.map(() => secret)
         this.inputPubkeys = tokenInputAmounts.map(() => pubkey)
@@ -850,10 +893,10 @@ export class UnsignedTokenTx {
     }
 
     addNonTokenInput(input: UnsignedInput, secret?: Uint8Array): number {
-        return this.addTokenInput(input, 0, secret)
+        return this.addTokenInput(input, new BigNumber('0'), secret)
     }
 
-    addTokenInput(input: UnsignedInput, tokenAmount: number, secret?: Uint8Array): number {
+    addTokenInput(input: UnsignedInput, tokenAmount: BigNumber, secret?: Uint8Array): number {
         if (this.unsignedTx === undefined)
             throw "Transaction has already been signed"
         if (secret === undefined) {
@@ -863,43 +906,43 @@ export class UnsignedTokenTx {
             this.inputSecrets.push(secret)
             this.inputPubkeys.push(this.curve.derivePublicKeyCompressed(secret))
         }
-        this.tokenInputAmounts.push(tokenAmount * this.tokenFactor)
+        this.tokenInputAmounts.push(tokenAmount.times(this.tokenFactor))
         if (Wallet.debug)
             console.log('add input', input, tokenAmount)
         return this.unsignedTx.add_input(input)
     }
 
     addNonTokenOutput(output: OutputType) {
-        this.addTokenOutput(output, 0)
+        this.addTokenOutput(output, new BigNumber('0'))
     }
 
-    addTokenOutput(output: OutputType, tokenAmount: number) {
+    addTokenOutput(output: OutputType, tokenAmount: BigNumber) {
         if (this.unsignedTx === undefined)
             throw "Transaction has already been signed"
-        this.tokenOutputAmounts.push(tokenAmount * this.tokenFactor)
+        this.tokenOutputAmounts.push(tokenAmount.times(this.tokenFactor))
         this.outputs.push(output)
     }
 
     private prepareTransaction(nonTokenAddress: string, tokenAddress: string, feePerKb?: number, ignoreOverspend?: boolean): cashcontracts.UnsignedTx {
         if (this.unsignedTx === undefined)
             throw "Transaction has already been signed"
-        const tokenLeftover = this.tokenInputAmounts.reduce((a, b) => a + b) - this.tokenOutputAmounts.reduce((a, b) => a + b)
-        if (tokenLeftover > 0)
+        const tokenLeftover = this.tokenInputAmounts.reduce((a, b) => a.plus(b)).minus(this.tokenOutputAmounts.reduce((a, b) => a.plus(b)))
+        if (tokenLeftover.gt(0))
             this.tokenOutputAmounts.push(tokenLeftover)
         this.unsignedTx.add_output({
             type: "SLP",
             token_id_hex: this.tokenDetails.id,
             token_type: 1,
-            output_quantities: this.tokenOutputAmounts.map(v => v.toString())
+            output_quantities: this.tokenOutputAmounts.map(v => v.toFixed(0))
         } as OutputType)
         if (Wallet.debug)
             console.log(this.outputs, this.unsignedTx)
         this.outputs.forEach(output => this.unsignedTx!.add_output(output))
-        if (tokenLeftover > 0)
+        if (tokenLeftover.gt(0))
             this.unsignedTx.add_output({
                 type: "P2PKH",
                 address: tokenAddress,
-                amount: DUST_AMOUNT.toString(),
+                amount: DUST_AMOUNT.toFixed(0),
             } as OutputType)
         this.unsignedTx.add_leftover_output(nonTokenAddress, feePerKb, ignoreOverspend)
         return this.unsignedTx
@@ -922,6 +965,8 @@ export class UnsignedTokenTx {
     }
 }
 
+export type BroadcastResult = {success: true, txid: string} | {success: false, msg: string}
+
 export class Tx {
     private tx: cashcontracts.Tx
 
@@ -933,130 +978,151 @@ export class Tx {
         return this.tx.hex()
     }
 
-    async broadcast(): Promise<string> {
+    async broadcast(): Promise<BroadcastResult> {
         const response = await fetch("https://rest.bitcoin.com/v2/rawtransactions/sendRawTransaction/" + this.hex())
-        return await response.text()
+        const result = await response.text()
+        if (result.startsWith('{')) {
+            const responseJson = JSON.parse(result)
+            if (responseJson.error)
+                return {success: false, msg: responseJson.error}
+        }
+        return {success: true, txid: result.replace(/"/g, '')}
     }
 }
 
-export function sendToAddressTx(wallet: Wallet, address: string, amount: number): Tx {
+export function sendToAddressTx(wallet: Wallet, address: string, amount: BigNumber): Tx {
     const txBuild = wallet.initNonTokenTx()
     txBuild.addOutput({
         type: 'P2PKH',
         address: address,
-        amount: amount.toString(),
+        amount: amount.toFixed(0),
     })
     txBuild.addLeftoverOutput(wallet.cashAddr())
     return txBuild.sign()
 }
 
-export function sendTokensToAddressTx(wallet: Wallet, address: string, tokenId: TokenId, amount: number): Tx {
+export function sendTokensToAddressTx(wallet: Wallet, address: string, tokenId: TokenId, amount: BigNumber): Tx {
     const txBuild = wallet.initTokenTx(tokenId)
     txBuild.addTokenOutput(
         {
             type: 'P2PKH',
             address: address,
-            amount: DUST_AMOUNT.toString(),
+            amount: DUST_AMOUNT.toFixed(0),
         },
         amount,
     )
     return txBuild.sign(wallet.cashAddr(), wallet.slpAddr())
 }
 
-export function feeSendNonToken(wallet: Wallet, amount: number): number {
+export function feeSendNonToken(wallet: Wallet, amount: BigNumber): BigNumber {
     const txBuild = wallet.initNonTokenTx()
     txBuild.addOutput({
         type: 'P2PKH',
         address: EMPTY_CASH_ADDR,
-        amount: amount.toString(),
+        amount: amount.toFixed(0),
     })
     txBuild.addLeftoverOutput(wallet.cashAddr(), undefined, true)
-    return txBuild.estimateSize()
+    return new BigNumber(txBuild.estimateSize())
 }
 
-export function feeSendToken(wallet: Wallet, tokenId: string, amount: number): number {
+export function feeSendToken(wallet: Wallet, tokenId: string, amount: BigNumber): BigNumber {
     const txBuild = wallet.initTokenTx(tokenId)
     txBuild.addTokenOutput(
         {
             type: 'P2PKH',
             address: EMPTY_SLP_ADDR,
-            amount: DUST_AMOUNT.toString(),
+            amount: DUST_AMOUNT.toFixed(0),
         },
         amount,
     )
-    return txBuild.estimateSize()
+    return new BigNumber(txBuild.estimateSize())
 }
 
 export interface TradeOfferParams {
     tokenId: TokenId
-    sellAmountToken: number
-    pricePerToken: number
+    sellAmountToken: BigNumber
+    pricePerToken: BigNumber
     receivingAddress: string
     feeAddress: string
-    feeDivisor: number
-    buyAmountToken?: number
+    feeDivisor: BigNumber
+    buyAmountToken?: BigNumber
 }
 
 interface TransformedOfferParams {
-    tokenFactor: number;
-    pricePerBaseToken: number;
-    isInverted: boolean;
-    scriptPrice: number;
-    sellAmountBaseToken: number;
-    scriptBuyAmount: string | undefined;
+    tokenFactor: BigNumber
+    pricePerBaseToken: BigNumber
+    isInverted: boolean
+    scriptPrice: BigNumber
+    sellAmountBaseToken: BigNumber
+    scriptBuyAmount: string | undefined
 }
 
-function transformOfferParams(wallet: Wallet, params: TradeOfferParams): TransformedOfferParams {
-    const tokenFactor = wallet.toTokenBaseAmount(params.tokenId, 1)
-    const pricePerBaseToken = params.pricePerToken / tokenFactor
-    const isInverted = pricePerBaseToken < 1
-    const scriptPrice = isInverted ? 1.0 / pricePerBaseToken : pricePerBaseToken
-    if (!Number.isInteger(scriptPrice))
-        throw "pricePerToken must either be an integer or the inverse of an integer."
-    const sellAmountBaseToken = params.sellAmountToken * tokenFactor
-    const toScriptBuyAmount = (buyAmountToken: number) => {
-        const buyAmountBaseToken = buyAmountToken * tokenFactor
+function transformOfferParams(tokenFactor: BigNumber, params: TradeOfferParams, adjustPrice=false): TransformedOfferParams {
+    let pricePerBaseToken = params.pricePerToken.div(tokenFactor)
+    let isInverted = pricePerBaseToken.lt('1')
+    let scriptPrice = isInverted ? new BigNumber('1').div(pricePerBaseToken) : pricePerBaseToken
+    if (!scriptPrice.isInteger()) {
+        if (adjustPrice) {
+            scriptPrice = scriptPrice.integerValue(BigNumber.ROUND_HALF_DOWN)
+            pricePerBaseToken = isInverted ? new BigNumber('1').div(scriptPrice) : scriptPrice
+            isInverted = pricePerBaseToken.lt('1')
+        }
+        else {
+            throw "pricePerToken must either be an integer or the inverse of an integer."
+        }
+    }
+    const sellAmountBaseToken = params.sellAmountToken.times(tokenFactor)
+    const toScriptBuyAmount = (buyAmountToken: BigNumber) => {
+        const buyAmountBaseToken = buyAmountToken.times(tokenFactor)
         if (isInverted) return buyAmountBaseToken
-        return buyAmountBaseToken * pricePerBaseToken
+        return buyAmountBaseToken.times(pricePerBaseToken)
     }
     const scriptBuyAmount = params.buyAmountToken !== undefined ?
-        toScriptBuyAmount(params.buyAmountToken).toString() :
+        toScriptBuyAmount(params.buyAmountToken).toFixed(0) :
         undefined
     return {tokenFactor, pricePerBaseToken, isInverted, scriptPrice, sellAmountBaseToken, scriptBuyAmount}
 }
 
-function tradeOfferOutput(wallet: Wallet, params: TradeOfferParams): AdvancedTradeOffer {
-    const transformed = transformOfferParams(wallet, params)
+function tradeOfferOutput(tokenFactor: BigNumber, params: TradeOfferParams): AdvancedTradeOffer {
+    const transformed = transformOfferParams(tokenFactor, params, true)
     return {
         type: 'AdvancedTradeOffer',
-        amount: DUST_AMOUNT.toString(),
+        amount: DUST_AMOUNT.toFixed(0),
         lokad_id: "EXCH",
         version: 2,
         power: 0,
         is_inverted: transformed.isInverted,
         token_id_hex: params.tokenId,
         token_type: 1,
-        sell_amount_token: transformed.sellAmountBaseToken.toString(),
-        price: transformed.scriptPrice.toString(),
+        sell_amount_token: transformed.sellAmountBaseToken.toFixed(0),
+        price: transformed.scriptPrice.toFixed(0),
         address: params.receivingAddress,
         spend_params: transformed.scriptBuyAmount,
         fee_address: params.feeAddress,
-        fee_divisor: params.feeDivisor,
+        fee_divisor: params.feeDivisor.toNumber(),
     }
 }
 
-export function acceptTradeOfferTx(wallet: Wallet, utxo: UtxoEntry, params: TradeOfferParams): Tx {
+export function acceptTradeOfferTx(wallet: Wallet, utxo: UtxoEntry, params: TradeOfferParams, tokenDetails: {decimals: number}): Tx {
     const buyAmountToken = params.buyAmountToken
     if (buyAmountToken === undefined)
         throw "Must set buyAmountToken to a number"
-    const transformedParams = transformOfferParams(wallet, params)
-    const buyAmountBaseToken = buyAmountToken * transformedParams.tokenFactor
-    const remainingAmountBaseToken = transformedParams.sellAmountBaseToken - buyAmountBaseToken
+    const tokenFactor = new BigNumber('10').pow(tokenDetails.decimals)
+    const transformedParams = transformOfferParams(tokenFactor, params, true)
+    const buyAmountBaseToken = buyAmountToken.times(transformedParams.tokenFactor)
+    const remainingAmountBaseToken = transformedParams.sellAmountBaseToken.minus(buyAmountBaseToken)
+    if (Wallet.debug)
+        console.log('transformedParams', transformedParams)
     if (Wallet.debug)
         console.log('remainingAmountToken', remainingAmountBaseToken)
     const txBuild = wallet.initNonTokenTx()
-    const offerInput = tradeOfferOutput(wallet, params)
-    const payAmount = params.pricePerToken * buyAmountToken
+    const offerInput = tradeOfferOutput(tokenFactor, params)
+    const payAmount = transformedParams.pricePerBaseToken.times(buyAmountBaseToken)
+    if (Wallet.debug) {
+        console.log('offerInput', offerInput)
+        console.log('slpAddress', wallet.slpAddr())
+        console.log('payAmount', payAmount)
+    }
     txBuild.addInputWithSecret(
         {
             tx_id_hex: utxo.txid,
@@ -1074,17 +1140,17 @@ export function acceptTradeOfferTx(wallet: Wallet, utxo: UtxoEntry, params: Trad
         type: 'SLP',
         token_id_hex: params.tokenId,
         token_type: 1,
-        output_quantities: remainingAmountBaseToken > 0 ?
-            [remainingAmountBaseToken.toString(), "0", buyAmountBaseToken.toString()] :
-            ["0", buyAmountBaseToken.toString()],
+        output_quantities: remainingAmountBaseToken.gt('0') ?
+            [remainingAmountBaseToken.toFixed(0), "0", buyAmountBaseToken.toFixed(0)] :
+            ["0", buyAmountBaseToken.toFixed(0)],
     }); numOutputs++;
-    if (remainingAmountBaseToken > 0) {
+    if (remainingAmountBaseToken.gt('0')) {
         txBuild.addOutput(
             {
                 type: 'P2SH',
-                output: tradeOfferOutput(wallet, {
+                output: tradeOfferOutput(tokenFactor, {
                     ...params,
-                    sellAmountToken: remainingAmountBaseToken,
+                    sellAmountToken: remainingAmountBaseToken.div(tokenFactor),
                     buyAmountToken: undefined,
                 })
             },
@@ -1094,43 +1160,106 @@ export function acceptTradeOfferTx(wallet: Wallet, utxo: UtxoEntry, params: Trad
         {
             type: 'P2PKH',
             address: params.receivingAddress,
-            amount: payAmount.toString(),
+            amount: payAmount.toFixed(0),
         },
     ); numOutputs++;
     txBuild.addOutput(
         {
             type: 'P2PKH',
             address: wallet.slpAddr(),
-            amount: DUST_AMOUNT.toString(),
+            amount: DUST_AMOUNT.toFixed(0),
         },
     ); numOutputs++;
     txBuild.addOutput(
         {
             type: 'P2PKH',
             address: params.feeAddress,
-            amount: Math.max(Math.floor(payAmount / params.feeDivisor), DUST_AMOUNT).toString(),
+            amount: BigNumber.max(payAmount.div(params.feeDivisor).integerValue(BigNumber.ROUND_DOWN), DUST_AMOUNT).toFixed(0),
         },
     ); numOutputs++;
     txBuild.insertLeftoverOutput(numOutputs - 1, wallet.cashAddr())
-    return txBuild.sign()
+    const tx = txBuild.sign()
+    if (Wallet.debug)
+        console.log(tx.hex())
+    return tx
 }
 
-export function advancedTradeOfferAddress(wallet: Wallet, params: TradeOfferParams): string {
-    const output = tradeOfferOutput(wallet, params)
+export function advancedTradeOfferAddress(tokenFactor: BigNumber, params: TradeOfferParams): string {
+    const output = tradeOfferOutput(tokenFactor, params)
     if (Wallet.debug)
         console.log(output)
     return cashcontracts.Address.from_output("simpleledger", output).cash_addr()
 }
 
-export function createAdvancedTradeOfferTxs(wallet: Wallet, params: TradeOfferParams) {
+export function verifyAdvancedTradeOffer(wallet: Wallet, tokenFactor: BigNumber, params: TradeOfferParams) {
+    if (!params.sellAmountToken.isFinite())
+        return {success: false, msg: "token sell amount must be a finite number"}
+    if (!params.pricePerToken.isFinite())
+        return {success: false, msg: "price must be a finite number"}
+    if (params.sellAmountToken.lte('0'))
+        return {success: false, msg: "token sell amount must be greater than 0"}
+    if (params.pricePerToken.lte('0'))
+        return {success: false, msg: "price must be greater than 0"}
+    if (params.buyAmountToken === undefined && wallet.tokenBalance(params.tokenId) < params.sellAmountToken)
+        return {success: false, msg: "insufficient token funds"}
+    let transformedParams
+    try {
+        transformedParams = transformOfferParams(tokenFactor, params, true)
+    } catch (e) {
+        return {success: false, msg: e}
+    }
+    if (transformedParams.pricePerBaseToken.gte(MAX_INT) || transformedParams.scriptPrice.gte(MAX_INT)) {
+        return {success: false, msg: "price too large"}
+    }
+    if (transformedParams.sellAmountBaseToken.gte(MAX_INT)) {
+        return {success: false, msg: "token sell amount too large"}
+    }
+    if (!transformedParams.sellAmountBaseToken.isInteger()) {
+        return {success: false, msg: "token sell amount has too many decimals" + transformedParams.sellAmountBaseToken}
+    }
+    const maxBuyAmountSats = transformedParams.pricePerBaseToken.times(transformedParams.sellAmountBaseToken)
+    if (maxBuyAmountSats.lt(DUST_AMOUNT)) {
+        return {success: false, msg: "total cost is below dust limit (<0.000 005 46 BCH)"}
+    }
+    if (!maxBuyAmountSats.isInteger()) {
+        return {success: false, msg: "total cost has too many decimals"}
+    }
+    if (maxBuyAmountSats.gt(MAX_INT)) {
+        return {success: false, msg: "total cost too large"}
+    }
+    if (params.buyAmountToken !== undefined && transformedParams.scriptBuyAmount !== undefined) {
+        const buyAmountBaseToken = params.buyAmountToken.times(tokenFactor)
+        if (!buyAmountBaseToken.isFinite()) {
+            return {success: false, msg: "token buy amount must a finite number"}
+        }
+        if (buyAmountBaseToken.lte('0')) {
+            return {success: false, msg: "token buy amount must be greater than 0"}
+        }
+        const buyAmountSats = buyAmountBaseToken.times(transformedParams.pricePerBaseToken)
+        if (buyAmountSats.lt(DUST_AMOUNT)) {
+            return {success: false, msg: "cost is below dust limit (<0.000 005 46 BCH)"}
+        }
+        if (wallet.nonTokenBalance() < buyAmountSats)
+            return {success: false, msg: "insufficient funds"}
+        const remainingBuyAmountBase = maxBuyAmountSats.minus(buyAmountSats)
+        if (remainingBuyAmountBase.gt('0') && remainingBuyAmountBase.lt(DUST_AMOUNT)) {
+            return {success: false, msg: "remaining cost is below dust limit (<0.000 005 46 BCH)"}
+        }
+        if (new BigNumber(transformedParams.scriptBuyAmount).gte(MAX_INT)) {
+            return {success: false, msg: "buy amount too large"}
+        }
+    }
+    return {success: true}
+}
+
+export function createAdvancedTradeOfferTxs(wallet: Wallet, tokenFactor: BigNumber, params: TradeOfferParams) {
     if (params.buyAmountToken !== undefined)
         throw "params.buyAmountToken must be set to undefined"
-    
     const offerTxMeasure = wallet.initTokenTx(params.tokenId, "none")
-    const transformedParams = transformOfferParams(wallet, params)
+    const transformedParams = transformOfferParams(tokenFactor, params, true)
     const offerOutput: P2SH = {
         type: 'P2SH',
-        output: tradeOfferOutput(wallet, params),
+        output: tradeOfferOutput(tokenFactor, params),
     }
     const pushDataOutput: PushOfferData = {
         type: "PushOfferData",
@@ -1140,7 +1269,7 @@ export function createAdvancedTradeOfferTxs(wallet: Wallet, params: TradeOfferPa
         version: 2,
         power: 0,
         is_inverted: transformedParams.isInverted,
-        price: transformedParams.scriptPrice,
+        price: transformedParams.scriptPrice.toNumber(),
         push_address: wallet.slpAddr(),
     }
     offerTxMeasure.addTokenInput(
@@ -1159,14 +1288,14 @@ export function createAdvancedTradeOfferTxs(wallet: Wallet, params: TradeOfferPa
         offerOutput,
         params.sellAmountToken,
     )
-    const txSize = offerTxMeasure.estimateSize()
-    const neededAmount = txSize + DUST_AMOUNT + 2
+    const txSize = new BigNumber(offerTxMeasure.estimateSize())
+    const neededAmount = txSize.plus(DUST_AMOUNT).plus('2')
     const glueTxBuild = wallet.initTokenTx(params.tokenId)
     const newPushDataOutput: P2SH = {
         type: "P2SH",
         output: {
             ...pushDataOutput,
-            amount: neededAmount.toString(),
+            amount: neededAmount.toFixed(0),
         },
     }
     glueTxBuild.addTokenOutput(
@@ -1191,4 +1320,50 @@ export function createAdvancedTradeOfferTxs(wallet: Wallet, params: TradeOfferPa
         params.sellAmountToken,
     )
     return [glueTx, offerTx.sign(wallet.cashAddr(), wallet.slpAddr())]
+}
+
+export function cancelTradeOfferTx(wallet: Wallet, utxo: UtxoEntry, params: TradeOfferParams, tokenDetails: {decimals: number}): Tx {
+    if (params.buyAmountToken !== undefined)
+        throw "Must set buyAmountToken to undefined"
+    const tokenFactor = new BigNumber(10).pow(tokenDetails.decimals)
+    const transformedParams = transformOfferParams(tokenFactor, params, true)
+    const txBuild = wallet.initNonTokenTx()
+    const offerInput = tradeOfferOutput(tokenFactor, params)
+    offerInput.spend_params = 'cancel'
+    if (Wallet.debug) {
+        console.log('offerInput', offerInput)
+        console.log('slpAddress', wallet.slpAddr())
+        console.log('utxo', utxo)
+        console.log('params', params)
+        console.log('transformedParams', transformedParams)
+    }
+    txBuild.addInput(
+        {
+            tx_id_hex: utxo.txid,
+            vout: utxo.vout,
+            sequence: 0xffff_ffff,
+            output: {
+                type: 'P2SH',
+                output: offerInput,
+            }
+        },
+    )
+    txBuild.addOutput({
+        type: 'SLP',
+        token_id_hex: params.tokenId,
+        token_type: 1,
+        output_quantities: [transformedParams.sellAmountBaseToken.toFixed(0)],
+    })
+    txBuild.addOutput(
+        {
+            type: 'P2PKH',
+            address: wallet.slpAddr(),
+            amount: DUST_AMOUNT.toFixed(0),
+        },
+    )
+    txBuild.addLeftoverOutput(wallet.cashAddr())
+    const tx = txBuild.sign()
+    if (Wallet.debug)
+        console.log(tx.hex())
+    return tx
 }
