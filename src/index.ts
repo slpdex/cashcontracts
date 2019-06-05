@@ -575,7 +575,7 @@ export class Wallet {
     }
 
     public toTokenBaseAmount(tokenId: TokenId, amount: BigNumber): BigNumber {
-        return amount.pow(new BigNumber('10').pow(this._tokenDetailStore.tokenDetails().get(tokenId, keyError(tokenId)).decimals))
+        return amount.times(new BigNumber('10').pow(this._tokenDetailStore.tokenDetails().get(tokenId, keyError(tokenId)).decimals))
     }
 
     public initNonTokenTx(include: "none" | undefined = undefined): UnsignedTx {
@@ -987,6 +987,316 @@ export class Tx {
                 return {success: false, msg: responseJson.error}
         }
         return {success: true, txid: result.replace(/"/g, '')}
+    }
+}
+
+export interface TxHistoryEntry {
+    txid: string
+    tokenId: string | null
+    timestamp: number | undefined
+    isSlp: boolean
+    inputs: {
+        slpAmountHex: string | null
+        satoshiAmount: number
+        address: string
+    }[]
+    outputs: {
+        slpAmountHex: string | null
+        satoshiAmount: number
+        address: string
+        vout: number
+    }[]
+}
+
+export interface TxHistoryItem {
+    txid: string
+    tokenId: string | undefined
+    timestamp: number | undefined
+    deltaSatoshis: BigNumber
+    deltaBaseToken: BigNumber | undefined
+    outputs: {
+        slpAmount: BigNumber
+        satoshiAmount: number
+        vout: number
+    }[]
+}
+
+export class AddressTxHistory {
+    private _slpAddress: string
+    private _cashAddress: string
+    private _baseAddress: string
+    private _txHistory: Map<TokenId, TxHistoryItem> = Map()
+    private _receivedTxListeners: (() => void)[] = []
+
+    private constructor(slpAddress: string, cashAddress: string) {
+        this._slpAddress = slpAddress
+        this._cashAddress = cashAddress
+        this._baseAddress = this._cashAddress.substr('bitcoincash:'.length)
+    }
+
+    public static async create(slpAddress: string, cashAddress: string): Promise<AddressTxHistory> {
+        const txHistory = new AddressTxHistory(slpAddress, cashAddress)
+        await txHistory._fetchTokenHistory()
+        txHistory._listenToTxs()
+        return txHistory
+    }
+
+    private async _fetchTokenHistory() {
+        const query = {
+            "v": 3,
+            "q": {
+                "db": ["u", "c"],
+                "aggregate": [
+                    {
+                        "$match": {
+                            "$or": [
+                                {"in.e.a": this._baseAddress},
+                                {"out.e.a": this._baseAddress},
+                            ],
+                        },
+                    },
+                    {
+                        "$unwind": "$in",
+                    },
+                    {
+                        "$lookup": {
+                            "from": "confirmed",
+                            "localField": "in.e.h",
+                            "foreignField": "tx.h",
+                            "as": "prevConfirmedTx",
+                        },
+                    },
+                    {
+                        "$lookup": {
+                            "from": "unconfirmed",
+                            "localField": "in.e.h",
+                            "foreignField": "tx.h",
+                            "as": "prevUnconfirmedTx",
+                        },
+                    },
+                    {
+                        "$addFields": {
+                            "prevTx": {
+                                "$arrayElemAt": [
+                                    {"$concatArrays": ["$prevConfirmedTx", "$prevUnconfirmedTx"]},
+                                    0,
+                                ],
+                            },
+                        },
+                    },
+                    {
+                        "$addFields": {
+                            "slpOutput": {"$arrayElemAt": ["$prevTx.out", 0]},
+                            "satoshiOutput": {
+                                "$arrayElemAt": [
+                                    "$prevTx.out",
+                                    "$in.e.i",
+                                ],
+                            },
+                        },
+                    },
+                    {
+                        "$group": {
+                            "_id": "$tx.h",
+                            "prevSlpInput": {"$push": "$slpOutput"},
+                            "prevInputs": {"$push": "$satoshiOutput"},
+                            "txInputs": {"$push": "$in"},
+                            "outputs": {"$first": "$out"},
+                            "timestamp": {"$first": "$blk.t"},
+                        },
+                    },
+                    {
+                        "$sort": {
+                            "timestamp": 1,
+                        },
+                    },
+                ],
+            },
+            "r": {
+                "f": `[.[] | {
+                    txid: ._id,
+                    inputs: [
+                        . as $tx |
+                        .txInputs | length | range(.) |
+                        {
+                            slpAmountHex: $tx.prevSlpInput[.][("h" + (($tx.txInputs[.].e.i + 4) | tostring))],
+                            satoshiAmount: $tx.prevInputs[.].e.v,
+                            address: $tx.prevInputs[.].e.a,
+                        }
+                    ],
+                    outputs: [
+                        . as $tx |
+                        .outputs | length | range(.) |
+                        select($tx.outputs[.].b1 != "${SLP_B64}") |
+                        {
+                            slpAmountHex: $tx.outputs[0][("h" + ((. + 4) | tostring))],
+                            satoshiAmount: $tx.outputs[.].e.v,
+                            address: $tx.outputs[.].e.a,
+                            vout: $tx.outputs[.].e.i,
+                        }
+                    ],
+                    isSlp: (.outputs[0].b1 == "${SLP_B64}"),
+                    tokenId: .outputs[0].h4,
+                    timestamp: .timestamp,
+                }]`.replace(/\r?\n|\r/g, ''),
+            },
+        }
+        const queryBase64 = Base64.encode(JSON.stringify(query))
+        const response = await fetch("https://bitdb.fountainhead.cash/q/" + queryBase64)
+        const utxosJson: {c: TxHistoryEntry[], u: TxHistoryEntry[]} = await response.json()
+        const txHistoryEntries = utxosJson.c.concat(utxosJson.u)
+        console.log(txHistoryEntries)
+        this._txHistory = this._txHistory.merge(Map(txHistoryEntries
+            .map(entry => ({
+                ...entry,
+                outputs: entry.outputs
+                    .filter(output => output.address == this._baseAddress)
+                    .map(output => ({
+                        ...output,
+                        slpAmount: output.slpAmountHex ? new BigNumber(output.slpAmountHex, 16) : new BigNumber('0'),
+                    })),
+                inputs: entry.inputs
+                    .filter(input => input.address == this._baseAddress)
+                    .map(input => ({
+                        ...input,
+                        slpAmount: input.slpAmountHex ? new BigNumber(input.slpAmountHex, 16) : new BigNumber('0'),
+                    })),
+            }))
+            .map(entry => {
+                return [
+                    entry.txid,
+                    {
+                        txid: entry.txid,
+                        tokenId: entry.isSlp && entry.tokenId ? entry.tokenId : undefined,
+                        timestamp: entry.timestamp || undefined,
+                        deltaSatoshis: new BigNumber(
+                            entry.outputs
+                                .map(output => output.slpAmount.isZero() ? output.satoshiAmount : 0)
+                                .reduce((a, b) => a + b, 0)
+                            - entry.inputs
+                                .map(input => input.slpAmount.isZero() ? input.satoshiAmount : 0)
+                                .reduce((a, b) => a + b, 0)
+                        ),
+                        deltaBaseToken: entry.isSlp ?
+                            entry.outputs
+                                .map(output => output.slpAmount)
+                                .reduce((a, b) => a.plus(b), new BigNumber('0'))
+                                .minus(
+                                    entry.inputs
+                                        .map(input => input.slpAmount)
+                                        .reduce((a, b) => a.plus(b), new BigNumber('0'))
+                                ) :
+                            undefined,
+                        outputs: entry.outputs.map(output => ({
+                            slpAmount: output.slpAmount,
+                            satoshiAmount: output.satoshiAmount,
+                            vout: output.vout,
+                        }))
+                    }
+                ]
+            })
+        ))
+        console.log(this._txHistory.toJS())
+    }
+
+    private _listenToTxs(): EventSource {
+        const query = {
+            "v": 3,
+            "q": {
+                "find": {
+                    "$or": [
+                        {"in.e.a": this._baseAddress},
+                        {"out.e.a": this._baseAddress},
+                    ],
+                },
+            },
+        }
+        const queryBase64 = Base64.encode(JSON.stringify(query))
+        const source = new EventSource("https://bitsocket.fountainhead.cash/s/" + queryBase64)
+        source.onmessage = (msg) => this._receivedTx(msg)
+        if (Wallet.debug)
+            console.log('created incoming source', source, query)
+        return source
+    }
+
+    private _receivedTx(msg: MessageEvent) {
+        const resp: {data: ReceivedTx[], type: string} = JSON.parse(msg.data)
+        if (Wallet.debug)
+            console.log(msg, resp)
+        if (resp.type == 'open' || resp.type == 'block')
+            return
+        if (resp.type == 'mempool') {
+            for (const tx of resp.data) {
+                let spentSatoshis = 0
+                let spentTokens = new BigNumber('0')
+                let receivedSatoshis = 0
+                let receivedTokens = new BigNumber('0')
+                tx.in.forEach(input => {
+                    const prevTx = this._txHistory.get(input.e.h)
+                    if (prevTx !== undefined) {
+                        const utxo = prevTx.outputs.find(output => output.vout == input.e.i)
+                        if (utxo !== undefined) {
+                            spentSatoshis += utxo.satoshiAmount
+                            spentTokens = spentTokens.plus(utxo.slpAmount)
+                        }
+                    }
+                }, 0)
+                const slpOutput: {[k: string]: string | undefined} = tx.out[0] as any
+                const outputs: TxHistoryItem["outputs"] = []
+                let tokenId: string | undefined = undefined
+                tx.out.forEach(output => {
+                    if (output.e.a == this._baseAddress) {
+                        let slpAmount = new BigNumber('0')
+                        if (slpOutput && slpOutput["b1"] == SLP_B64) {
+                            const slpAmountHex = slpOutput["h" + (output.e.i + 4)]
+                            if (slpAmountHex !== undefined)
+                                slpAmount = new BigNumber(slpAmountHex)
+                        }
+                        outputs.push({
+                            slpAmount,
+                            satoshiAmount: output.e.v,
+                            vout: output.e.i,
+                        })
+                        tokenId = slpOutput["h4"]
+                        receivedSatoshis += output.e.v
+                        receivedTokens = receivedTokens.plus(slpAmount)
+                    }
+                })
+                if (Wallet.debug)
+                    console.log({
+                        txid: tx.tx.h,
+                        tokenId,
+                        timestamp: undefined,
+                        deltaSatoshis: new BigNumber(receivedSatoshis - spentSatoshis),
+                        deltaBaseToken: receivedTokens.minus(spentTokens),
+                        outputs,
+                    })
+                this._txHistory = this._txHistory.set(
+                    tx.tx.h,
+                    {
+                        txid: tx.tx.h,
+                        tokenId,
+                        timestamp: undefined,
+                        deltaSatoshis: new BigNumber(receivedSatoshis - spentSatoshis),
+                        deltaBaseToken: receivedTokens.minus(spentTokens),
+                        outputs,
+                    }
+                )
+                if (Wallet.debug)
+                    console.log(this._txHistory.toJS())
+            }
+            this._receivedTxListeners.forEach(listener => listener())
+        }
+    }
+
+    public addReceivedTxListener(listener: () => void) {
+        if (Wallet.debug)
+            console.log('addReceivedTxListener', listener)
+        this._receivedTxListeners.push(listener)
+    }
+
+    public txHistory(): Map<TokenId, TxHistoryItem> {
+        return this._txHistory
     }
 }
 
