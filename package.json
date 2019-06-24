@@ -1,6 +1,6 @@
 {
     "name": "cashcontracts",
-    "version": "0.1.25",
+    "version": "0.1.26",
     "description": "A library for creating smart contracts on the Bitcoin Cash blockchain",
     "main": "./dist/index.js",
     "typings": "./dist/index.d.ts",
